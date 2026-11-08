@@ -1,0 +1,77 @@
+name: Release bootstrap
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+  issues: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the temporary upload
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build the clean root commit and replace main
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/clean
+          mkdir -p /tmp/clean
+          tar -xzf release.tar.gz -C /tmp/clean
+          rm -rf /tmp/clean/.github/workflows
+          mkdir -p /tmp/clean/.github/workflows
+          cp .github/workflows/release-bootstrap.yml /tmp/clean/.github/workflows/
+          cd /tmp/clean
+          git init -q
+          git config user.name "Jash Shah"
+          git config user.email "jashshah854@gmail.com"
+          git add -A
+          git commit -q -m "Release Team Bus v0.1.0 as a generic OSS core"
+          git branch -M main
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --force origin main
+
+      - name: Tag, release, metadata, and issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create v0.1.0 \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target main \
+            --title "Team Bus v0.1.0" \
+            --notes "First public release: a self-hosted agent-to-agent message bus with an addressed inbox and a shared facts board. MIT licensed. See README.md for the quickstart."
+          gh api -X PATCH "repos/${GITHUB_REPOSITORY}" \
+            -f description="Self-hosted agent-to-agent message bus: addressed inbox, shared facts board, lease-based delivery." \
+            -f homepage=""
+          printf '%s' '{"names":["ai-agents","multi-agent","coordination","message-bus","python"]}' | \
+            gh api -X PUT "repos/${GITHUB_REPOSITORY}/topics" \
+              -H "Accept: application/vnd.github+json" --input -
+          gh label create "good first issue" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --color "7057ff" \
+            --description "Good entry point for a new contributor" 2>/dev/null || true
+          gh issue create --repo "${GITHUB_REPOSITORY}" \
+            --title "Add a Docker Compose quickstart" \
+            --label "good first issue" \
+            --body "The quickstart assumes a local Postgres. Add a compose file that starts Postgres, applies schema.sql, and runs the dispatcher."
+          gh issue create --repo "${GITHUB_REPOSITORY}" \
+            --title "Add a typed Python client" \
+            --label "good first issue" \
+            --body "teambus.py is CLI-first. Add a small importable client with typed methods for send, inbox, claim, and done."
+          gh issue create --repo "${GITHUB_REPOSITORY}" \
+            --title "Add an end-to-end message test" \
+            --label "good first issue" \
+            --body "The tests cover protocol parsing. Add a test that starts Postgres, sends a message, claims it, and marks it done."
+          if gh workflow run test.yml --repo "${GITHUB_REPOSITORY}" --ref main 2>/dev/null; then
+            echo "CI dispatched"
+          else
+            echo "test.yml is not on main yet; CI will run when it is added"
+          fi

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "teambus"
+version = "0.1.0"
+description = "A self-hosted message bus for a fleet of AI agents: addressed inboxes, presence and a shared facts board in Postgres."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+dependencies = ["psycopg2-binary>=2.9"]
+keywords = ["ai-agents", "multi-agent", "coordination", "message-bus", "postgres"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent",
+  "Topic :: System :: Distributed Computing",
+]
+
+[project.urls]
+Homepage = "https://github.com/jashshah854-a11y/team-bus-oss"
+Issues = "https://github.com/jashshah854-a11y/team-bus-oss/issues"
+
+[tool.setuptools]
+py-modules = ["teambus"]

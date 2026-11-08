@@ -1,0 +1,11 @@
+{
+  "member": "alice",
+  "db": {
+    "transport": "pg-direct",
+    "host": "127.0.0.1",
+    "port": 5432,
+    "dbname": "teambus",
+    "user": "teambus_agent",
+    "password_file": "/path/to/private/password-file"
+  }
+}
