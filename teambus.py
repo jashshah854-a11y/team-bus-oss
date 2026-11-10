@@ -26,6 +26,9 @@ Usage:
   teambus.py [--config PATH] task add <owner> <title...>  (shared to-do; owner is a member name)
   teambus.py [--config PATH] task done <id> [note...]
   teambus.py [--config PATH] tasks [owner | --all]        (open to-dos; --all includes done)
+  teambus.py [--config PATH] compact --older-than 90d [--dry-run] [--export FILE.jsonl.gz]
+                                    (move done mail and superseded/retired facts to the archive tables; never deletes)
+  teambus.py [--config PATH] history <member|key> [--limit N]  (full trace across hot + archive tables)
 
 Config (JSON): {"member": "alice", "db": {...}} where db.transport is one of
   "pg-direct"  Direct psycopg2: host, port, dbname, user, password_file.
@@ -406,6 +409,168 @@ def cmd_retire(cfg, key, reason):
     return cmd_fact(cfg, key, RETIRED_PREFIX + reason, False, None)
 
 
+# ---------------------------------------------------------------- compaction
+# Archive, never delete: every row that leaves a hot table lands in its
+# archive twin inside the same statement, so a failure moves nothing.
+
+MSG_COLS = ("seq, from_member, to_member, body, kind, state, idempotency_key, claimed_by, "
+            "claim_lease_until, created_at, claimed_at, done_at")
+FACT_COLS = "id, key, kind, body, posted_by, idempotency_key, supersedes, superseded_by, created_at"
+
+# Done mail whose finish (or, failing that, creation) is older than the cutoff.
+MSG_WHERE = "state = 'done' AND COALESCE(done_at, created_at) < %(cutoff)s"
+# A superseded fact moves once it AND its successor are older than the cutoff
+# (the successor may already be archived). A RETIRED tombstone that is the
+# current head moves once it is older than the cutoff, taking its key off the
+# hot table; `history <key>` still shows it.
+FACT_WHERE = """(
+  (f.superseded_by IS NOT NULL AND f.created_at < %(cutoff)s AND
+   COALESCE((SELECT s.created_at FROM team_facts s WHERE s.id = f.superseded_by),
+            (SELECT a.created_at FROM team_facts_archive a WHERE a.id = f.superseded_by)) < %(cutoff)s)
+  OR
+  (f.superseded_by IS NULL AND f.body LIKE %(retired)s AND f.created_at < %(cutoff)s)
+)"""
+
+
+def parse_age(text):
+    import datetime as _dt
+    t = text.strip().lower()
+    if len(t) < 2 or t[-1] not in "dh" or not t[:-1].isdigit():
+        raise SystemExit("teambus: --older-than takes Nd or Nh, e.g. 90d")
+    n = int(t[:-1])
+    return _dt.timedelta(days=n) if t[-1] == "d" else _dt.timedelta(hours=n)
+
+
+def compact(conn, older_than, dry_run=False, export_path=None):
+    """Move old finished rows into the archive tables in one transaction.
+    Returns {'messages': n, 'facts': n, 'dry_run': bool, 'cutoff': iso}.
+    Idempotent: a second run with the same cutoff finds nothing to move."""
+    import datetime as _dt
+    cutoff = _dt.datetime.now(_dt.timezone.utc) - older_than
+    params = {"cutoff": cutoff, "retired": RETIRED_PREFIX + "%"}
+    conn.autocommit = False
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT to_regclass('team_messages_archive'), to_regclass('team_facts_archive')")
+        if None in cur.fetchone():
+            raise SystemExit("teambus: archive tables missing; run tools/migrate_archive.py --apply first")
+        # Hold off new fact posts for the few ms the move takes, so no head is
+        # superseded while its chain is being moved.
+        cur.execute("LOCK TABLE team_facts IN SHARE ROW EXCLUSIVE MODE")
+        if dry_run:
+            cur.execute("SELECT count(*) FROM team_messages WHERE " + MSG_WHERE, params)
+            nm = cur.fetchone()[0]
+            cur.execute("SELECT count(*) FROM team_facts f WHERE " + FACT_WHERE, params)
+            nf = cur.fetchone()[0]
+            conn.rollback()
+            return {"messages": nm, "facts": nf, "dry_run": True, "cutoff": cutoff.isoformat()}
+        cur.execute(
+            "WITH moved AS (DELETE FROM team_messages WHERE " + MSG_WHERE + " RETURNING " + MSG_COLS + ") "
+            "INSERT INTO team_messages_archive (" + MSG_COLS + ") SELECT " + MSG_COLS + " FROM moved "
+            "RETURNING " + MSG_COLS, params)
+        mrows = cur.fetchall()
+        cur.execute(
+            "WITH pick AS (SELECT f.id FROM team_facts f WHERE " + FACT_WHERE + "), "
+            "moved AS (DELETE FROM team_facts WHERE id IN (SELECT id FROM pick) RETURNING " + FACT_COLS + ") "
+            "INSERT INTO team_facts_archive (" + FACT_COLS + ") SELECT " + FACT_COLS + " FROM moved "
+            "RETURNING " + FACT_COLS, params)
+        frows = cur.fetchall()
+        tmp = None
+        if export_path and (mrows or frows):
+            tmp = _write_export(export_path + ".partial", mrows, frows, cutoff)
+        conn.commit()
+        if tmp:
+            os.replace(tmp, export_path)
+        return {"messages": len(mrows), "facts": len(frows), "dry_run": False, "cutoff": cutoff.isoformat()}
+    except BaseException:
+        conn.rollback()
+        if export_path and os.path.exists(export_path + ".partial"):
+            os.remove(export_path + ".partial")
+        raise
+    finally:
+        cur.close()
+        conn.autocommit = True
+
+
+def _write_export(path, mrows, frows, cutoff):
+    import gzip
+    mcols = [c.strip() for c in MSG_COLS.split(",")]
+    fcols = [c.strip() for c in FACT_COLS.split(",")]
+    with gzip.open(path, "wt", encoding="utf-8") as fh:
+        fh.write(json.dumps({"table": "_meta", "cutoff": cutoff.isoformat(),
+                             "messages": len(mrows), "facts": len(frows)}) + "\n")
+        for r in mrows:
+            fh.write(json.dumps(dict({"table": "team_messages"}, **dict(zip(mcols, r))), default=str) + "\n")
+        for r in frows:
+            fh.write(json.dumps(dict({"table": "team_facts"}, **dict(zip(fcols, r))), default=str) + "\n")
+    return path
+
+
+def cmd_compact(cfg, age, dry_run, export):
+    conn = connect(cfg, write=True)
+    try:
+        r = compact(conn, parse_age(age), dry_run, export)
+    finally:
+        conn.close()
+    verb = "would archive" if r["dry_run"] else "archived"
+    tail = ""
+    if export and not r["dry_run"] and (r["messages"] or r["facts"]):
+        tail = "; export %s" % export
+    print("%s %d message(s) and %d fact(s) older than %s (cutoff %s)%s"
+          % (verb, r["messages"], r["facts"], age, r["cutoff"], tail))
+    return 0
+
+
+def history(conn, target, limit=200):
+    """Full trace for a member (mail to/from) or a fact key, hot + archive."""
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM team_members WHERE name = %s", (target,))
+    is_member = cur.fetchone() is not None
+    cur.execute("SELECT to_regclass('team_messages_archive') IS NOT NULL")
+    has_archive = cur.fetchone()[0]
+    if is_member:
+        q = ("SELECT seq, from_member, to_member, state, created_at, done_at, body, 'hot' FROM team_messages "
+             "WHERE from_member = %(t)s OR to_member = %(t)s")
+        if has_archive:
+            q += (" UNION ALL SELECT seq, from_member, to_member, state, created_at, done_at, body, 'archive' "
+                  "FROM team_messages_archive WHERE from_member = %(t)s OR to_member = %(t)s")
+        cur.execute("SELECT * FROM (" + q + ") x ORDER BY seq DESC LIMIT %(n)s", {"t": target, "n": limit})
+        out = [("message",) + tuple(r) for r in cur.fetchall()]
+    else:
+        q = ("SELECT id, key, kind, posted_by, created_at, superseded_by, body, 'hot' FROM team_facts "
+             "WHERE key = %(t)s")
+        if has_archive:
+            q += (" UNION ALL SELECT id, key, kind, posted_by, created_at, superseded_by, body, 'archive' "
+                  "FROM team_facts_archive WHERE key = %(t)s")
+        cur.execute("SELECT * FROM (" + q + ") x ORDER BY id DESC LIMIT %(n)s", {"t": target, "n": limit})
+        out = [("fact",) + tuple(r) for r in cur.fetchall()]
+    cur.close()
+    return out
+
+
+def cmd_history(cfg, target, limit):
+    conn = connect(cfg)
+    try:
+        rows = history(conn, target, limit)
+    finally:
+        conn.close()
+    if not rows:
+        print("no history for '%s'" % target)
+        return 0
+    for r in rows:
+        if r[0] == "message":
+            _, seq, frm, to, state, at, done, body, where = r
+            print('<message seq="%d" from="%s" to="%s" state="%s" at="%s" in="%s">%s</message>'
+                  % (seq, frm, to, state, at, where, body))
+        else:
+            _, fid, key, kind, by, at, sup, body, where = r
+            state = "current" if sup is None else "superseded by %d" % sup
+            print('<fact id="%d" key="%s" kind="%s" by="%s" at="%s" state="%s" in="%s">%s</fact>'
+                  % (fid, key, kind, by, at, state, where, body))
+    print("%d row(s), newest first" % len(rows))
+    return 0
+
+
 def cmd_facts(cfg, key):
     conn = connect(cfg)
     cur = conn.cursor()
@@ -543,6 +708,22 @@ def main(argv):
     if cmd == "tasks":
         owner = next((a for a in rest if not a.startswith("--")), None)
         return cmd_tasks(cfg, owner, "--all" in rest)
+    if cmd == "compact":
+        if "--older-than" not in rest:
+            raise SystemExit("usage: teambus.py compact --older-than 90d [--dry-run] [--export FILE.jsonl.gz]")
+        age = rest[rest.index("--older-than") + 1]
+        export = rest[rest.index("--export") + 1] if "--export" in rest else None
+        return cmd_compact(cfg, age, "--dry-run" in rest, export)
+    if cmd == "history":
+        limit = 200
+        args = list(rest)
+        if "--limit" in args:
+            i = args.index("--limit")
+            limit = int(args[i + 1])
+            del args[i:i + 2]
+        if len(args) != 1:
+            raise SystemExit("usage: teambus.py history <member|key> [--limit N]")
+        return cmd_history(cfg, args[0], limit)
     if cmd == "retire":
         if len(rest) < 2:
             raise SystemExit("usage: teambus.py retire <key> <reason...>")

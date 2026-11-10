@@ -71,13 +71,48 @@ pip install psycopg2-binary
    python teambus.py --config bob.json facts
    ```
 
-5. **Optional:** add a scheduler or listener appropriate to your agent runtime. Team Bus itself stays transport-neutral.
+5. **Wake the addressed agent (dispatcher).** Without it, members learn about mail when they next run `inbox`. The dispatcher polls the bus every couple of seconds and taps only the member a message is addressed to (a facts-board post taps everyone but its poster):
+
+   ```bash
+   # a member for the dispatcher itself, so `who` shows the wake layer is alive
+   psql "$DATABASE_URL" -c "INSERT INTO team_members (name, kind, location) VALUES ('dispatcher','service','server');"
+   echo '{"member": "dispatcher", "db": {"transport": "pg-dsn", "dsn": "'"$DATABASE_URL"'"}}' > teambus.config.json
+   cp dispatcher.example.json dispatcher.json   # edit: how each member is woken
+   python dispatcher.py                         # foreground; Ctrl+C to stop
+   ```
+
+   Every member gets one JSON line per event in `spool/<member>.jsonl`, which any agent runtime can tail. Per member, `dispatcher.json` can add a `command` (run once per cycle with that member's new events as JSON lines on stdin, e.g. a script that notifies a desktop app or starts a CLI agent) or a `notice_file` (an unread counter in `spool/<member>-notice.json`). A tap is only a hint: the message itself stays in the bus until the member claims it, so a missed tap loses nothing. Each dispatch is logged with posted, detected and dispatched times in `dispatcher-log.jsonl`.
+
+   To run it as a service on Linux (systemd), from the checkout: `./install-dispatcher.sh`. Re-run it after an upgrade.
+
+6. **Optional: dead-man's switch.** `python teambus_deadman.py` checks that heartbeats are fresh and no mail sits undone for hours, and pages your phone through [ntfy](https://ntfy.sh) when the bus stalls. Run it from cron every 15 minutes.
+
+## Compaction: keep everything, keep it fast
+
+Nothing on the bus is ever deleted. Over time, finished mail and replaced facts pile up, so `compact` moves them into archive tables in one all-or-nothing transaction and `history` reads both:
+
+```bash
+python tools/migrate_archive.py              # existing installs: prints the migration
+python tools/migrate_archive.py --apply      # run once, as the database owner
+python teambus.py --config owner.json compact --older-than 90d --dry-run
+python teambus.py --config owner.json compact --older-than 90d --export archive-2026-11.jsonl.gz
+python teambus.py --config alice.json history deploy-window   # a fact key, hot + archived versions
+python teambus.py --config alice.json history bob --limit 50  # a member's mail, hot + archived
+```
+
+What moves: messages in state `done` finished before the cutoff, and facts that were superseded (when both the old row and its replacement are older than the cutoff) or retired. Queued, claimed and held mail, and every current fact, stay put, so inboxes and the board read exactly the same afterwards. A second run moves nothing. `--export` also writes the moved rows to a gzip JSONL file.
+
+`compact` needs DELETE on the hot tables, which `grants.sql` deliberately withholds from `teambus_agent`, so run it with an owner config. Agents get read-only access to the archive tables for `history`. The migration also drops the `team_facts.supersedes` foreign key, because a current fact keeps pointing at its archived predecessor; new installs get this from `schema.sql`.
 
 ## Files
 
 | File | What it is |
 |---|---|
-| `teambus.py` | Member CLI: who, send, inbox, claim, done, heartbeat, fact, facts, task |
+| `teambus.py` | Member CLI: who, send, inbox, claim, done, heartbeat, fact, facts, task, compact, history |
+| `dispatcher.py`, `dispatcher.example.json` | Wake layer: taps the addressed member when mail or a fact lands |
+| `install-dispatcher.sh`, `teambus-dispatcher.service` | Installs the dispatcher as a systemd service |
+| `teambus_deadman.py` | Dead-man's switch: pages your phone when the bus stalls |
+| `tools/migrate_archive.py` | Adds the archive tables to an existing install |
 | `schema.sql`, `grants.sql` | Tables and least-privilege runtime grants |
 | `config.example.json` | Safe config shape with placeholders |
 | `PROTOCOL.md` | The operating rules members run under |

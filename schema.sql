@@ -54,7 +54,10 @@ CREATE TABLE IF NOT EXISTS public.team_facts (
     body            text NOT NULL,
     posted_by       text NOT NULL REFERENCES public.team_members(name),
     idempotency_key text NOT NULL UNIQUE,
-    supersedes      bigint REFERENCES public.team_facts(id),
+    -- supersedes is a plain id, not a foreign key: once `teambus.py compact`
+    -- moves an old version to team_facts_archive, the current row still
+    -- points at it, and `teambus.py history <key>` follows it across both.
+    supersedes      bigint,
     superseded_by   bigint REFERENCES public.team_facts(id),
     created_at      timestamptz NOT NULL DEFAULT now()
 );
@@ -65,3 +68,38 @@ CREATE INDEX IF NOT EXISTS team_facts_feed_idx
     ON public.team_facts (id);
 
 -- No members are seeded. Add only the members your installation needs.
+
+-- Archive tables for `teambus.py compact`: finished rows move here, never
+-- deleted. Same columns as the hot tables plus archived_at; primary key and
+-- lookup indexes only. Existing installs: run tools/migrate_archive.py.
+CREATE TABLE IF NOT EXISTS public.team_messages_archive (
+    seq               bigint PRIMARY KEY,
+    from_member       text NOT NULL,
+    to_member         text NOT NULL,
+    body              text NOT NULL,
+    kind              text NOT NULL,
+    state             text NOT NULL,
+    idempotency_key   text NOT NULL,
+    claimed_by        text,
+    claim_lease_until timestamptz,
+    created_at        timestamptz NOT NULL,
+    claimed_at        timestamptz,
+    done_at           timestamptz,
+    archived_at       timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS team_messages_archive_from_idx ON public.team_messages_archive (from_member, seq);
+CREATE INDEX IF NOT EXISTS team_messages_archive_to_idx   ON public.team_messages_archive (to_member, seq);
+
+CREATE TABLE IF NOT EXISTS public.team_facts_archive (
+    id              bigint PRIMARY KEY,
+    key             text NOT NULL,
+    kind            text NOT NULL,
+    body            text NOT NULL,
+    posted_by       text NOT NULL,
+    idempotency_key text NOT NULL,
+    supersedes      bigint,
+    superseded_by   bigint,
+    created_at      timestamptz NOT NULL,
+    archived_at     timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS team_facts_archive_key_idx ON public.team_facts_archive (key, id);
