@@ -1,0 +1,8 @@
+{
+  "teambus_config": "teambus.config.json",
+  "poll_interval_s": 2,
+  "members": {
+    "alice": {"notice_file": true},
+    "bob": {"command": ["notify-send", "Team Bus", "new mail for bob"]}
+  }
+}

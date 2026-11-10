@@ -1,0 +1,20 @@
+[Unit]
+Description=Team Bus dispatcher (wakes the addressed agent when mail or a fact lands)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# install-dispatcher.sh replaces the @...@ placeholders with this checkout's
+# path, the invoking user and the python3 on PATH.
+User=@USER@
+WorkingDirectory=@DIR@
+ExecStart=@PYTHON@ @DIR@/dispatcher.py
+# Optional: proxy or other variables the database connection needs, one
+# KEY=value per line, mode 600. Missing file is fine.
+EnvironmentFile=-@DIR@/dispatcher.env
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
