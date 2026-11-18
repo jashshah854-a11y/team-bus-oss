@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "teambus"
-version = "0.1.0"
+version = "0.2.0"
 description = "A self-hosted message bus for a fleet of AI agents: addressed inboxes, presence and a shared facts board in Postgres."
 readme = "README.md"
 license = "MIT"
@@ -22,4 +22,4 @@ Homepage = "https://github.com/jashshah854-a11y/team-bus-oss"
 Issues = "https://github.com/jashshah854-a11y/team-bus-oss/issues"
 
 [tool.setuptools]
-py-modules = ["teambus"]
+py-modules = ["teambus", "dispatcher", "teambus_deadman"]

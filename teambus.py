@@ -2,40 +2,53 @@
 """Team Bus member CLI.
 
 One addressed inbox for a team's agents, backed by Postgres tables
-(`team_members`, `team_messages`, and `team_facts`).
+(`team_members`, `team_messages`, `team_facts`, ...).
 
-  - Identity comes from the local config file, NEVER from a command argument
-    (agent-bus rule): a member cannot send as someone else.
-  - Presence is heartbeat + TTL, computed at read time (Matrix pattern).
-  - Delivery is claim-with-lease + explicit done + idempotency keys
-    (Agent DMs semantics). Reading never deletes.
-  - Unknown recipient is a hard error with close-match suggestions.
-  - Poll by monotonic sequence number; no `LISTEN/NOTIFY` dependency.
+  - Identity comes from the database login, enforced by the database
+    (identity_mode 'enforced'): each member connects with its own login role,
+    mapped in team_members.db_role. The config's "member" must match it. In
+    'trusted' mode (v0.1 behaviour) the config's member name is believed.
+  - Every write goes through a teambus_* function (api.sql) that applies
+    identity, authority (only owners post directives), the recipient's
+    hold/refuse policy, the inbox and rate fuses, and the message state machine.
+  - Presence is heartbeat + TTL, computed at read time.
+  - Delivery is claim-with-lease + explicit done. A claim returns a token;
+    done/renew/fail must present it, so a worker whose lease expired cannot
+    finish a newer attempt. Reading never deletes.
+  - Idempotency keys are remembered for life, across compaction.
+  - Message and fact text is untrusted data. Default output escapes it inside
+    a tagged envelope; `--json` emits one JSON object per line with metadata
+    and content in separate fields (use this from adapters).
 
 Usage:
-  teambus.py [--config PATH] who
+  teambus.py [--config PATH] [--json] whoami
+  teambus.py [--config PATH] [--json] who
   teambus.py [--config PATH] send <member> <body...> [--key IDEMPOTENCY_KEY]
-  teambus.py [--config PATH] inbox [--counts]
-  teambus.py [--config PATH] claim
-  teambus.py [--config PATH] done <seq>
+  teambus.py [--config PATH] [--json] inbox [--counts]
+  teambus.py [--config PATH] [--json] claim [--from MEMBER] [--seq N]
+  teambus.py [--config PATH] renew <seq> --token T [--minutes N]
+  teambus.py [--config PATH] done <seq> [--token T]   (no token: finish an unclaimed queued message)
+  teambus.py [--config PATH] fail <seq> --token T <reason...>
+  teambus.py [--config PATH] release <seq>            (held or failed -> queued)
   teambus.py [--config PATH] heartbeat
+  teambus.py [--config PATH] on|off <member>          (yourself, or anyone if you are an owner)
   teambus.py [--config PATH] fact [--directive] <key> <body...> [--key IDEM]
-  teambus.py [--config PATH] facts [key]
-  teambus.py [--config PATH] claim --seq N              (lease one exact message)
-  teambus.py [--config PATH] retire <key> <reason...>   (hide a finished fact)
-  teambus.py [--config PATH] task add <owner> <title...>  (shared to-do; owner is a member name)
+  teambus.py [--config PATH] [--json] facts [key]
+  teambus.py [--config PATH] retire <key> <reason...>
+  teambus.py [--config PATH] task add <owner> <title...>
   teambus.py [--config PATH] task done <id> [note...]
-  teambus.py [--config PATH] tasks [owner | --all]        (open to-dos; --all includes done)
+  teambus.py [--config PATH] [--json] tasks [owner | --all]
   teambus.py [--config PATH] compact --older-than 90d [--dry-run] [--export FILE.jsonl.gz]
-                                    (move done mail and superseded/retired facts to the archive tables; never deletes)
-  teambus.py [--config PATH] history <member|key> [--limit N]  (full trace across hot + archive tables)
+  teambus.py [--config PATH] [--json] history <member|key> [--limit N]
 
 Config (JSON): {"member": "alice", "db": {...}} where db.transport is one of
   "pg-direct"  Direct psycopg2: host, port, dbname, user, password_file.
-  "pg-dsn"     Full libpq DSN string in key "dsn" (tests).
+  "pg-dsn"     Full libpq DSN string in key "dsn".
 
-Config resolution order: --config, $TEAMBUS_CONFIG, ./teambus.config.json,
-~/.teambus.json. The DB password is never printed.
+Config resolution: --config, then $TEAMBUS_CONFIG; if either is given and the
+file is missing, that is an error (never a silent fallback to another
+identity). Otherwise ./teambus.config.json, then ~/.teambus.json.
+The DB password is never printed.
 """
 import difflib
 import json
@@ -44,23 +57,19 @@ import sys
 import time
 import uuid
 
-LEASE_MINUTES = 15          # claim lease (Agent DMs semantics)
-INBOX_CAP = 50              # flood fuse (0 = off)
-SEND_RATE_PER_HOUR = 30     # loop fuse per sender (0 = off)
-
 PGPASS = os.path.expanduser("~/.pgpass")
 
-# Poke file for the dispatcher's adaptive backoff (2026-10-28): after a
-# send or fact post lands in the store, touching this local file tells
-# the dispatcher to run a cycle now instead of waiting out its idle
-# backoff (up to 600s). Local filesystem only, no DB cost.
-POKE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         "state", "poke")
+# Poke file for the dispatcher's adaptive backoff: after a send or fact post
+# lands in the store, touching this local file tells a dispatcher on the same
+# machine to run a cycle now. Remote senders cannot reach it; see PROTOCOL.md
+# for the wake-latency contract.
+POKE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state", "poke")
+
+OUTPUT = {"json": False}
 
 
 def poke_dispatcher():
-    """Best-effort wake for the local dispatcher; never fails a send.
-    A missed poke only falls back to the dispatcher's next poll."""
+    """Best-effort wake for the local dispatcher; never fails a send."""
     try:
         os.makedirs(os.path.dirname(POKE_PATH), exist_ok=True)
         with open(POKE_PATH, "a"):
@@ -70,14 +79,52 @@ def poke_dispatcher():
         pass
 
 
+# ---------------------------------------------------------------- output
+
+def _esc(text, quote=False):
+    s = str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return s.replace('"', "&quot;") if quote else s
+
+
+def emit(tag, attrs, body=None):
+    """One record. Default: <tag k="v">escaped body</tag>, where body text can
+    never close the envelope or forge attributes. --json: one JSON object with
+    "type", the metadata fields, and "body" kept separate."""
+    if OUTPUT["json"]:
+        rec = {"type": tag}
+        rec.update({k: v for k, v in attrs.items()})
+        if body is not None:
+            rec["body"] = body
+        print(json.dumps(rec, default=str))
+        return
+    a = "".join(' %s="%s"' % (k, _esc(v, True)) for k, v in attrs.items() if v is not None)
+    if body is None:
+        print("<%s%s/>" % (tag, a))
+    else:
+        print("<%s%s>%s</%s>" % (tag, a, _esc(body), tag))
+
+
+def note(text):
+    """Human summary line; suppressed in --json mode."""
+    if not OUTPUT["json"]:
+        print(text)
+
+
 # ---------------------------------------------------------------- config
 
 def load_config(path):
-    candidates = [path, os.environ.get("TEAMBUS_CONFIG"),
-                  os.path.join(os.getcwd(), "teambus.config.json"),
-                  os.path.expanduser("~/.teambus.json")]
+    explicit = path or os.environ.get("TEAMBUS_CONFIG")
+    if explicit:
+        if not os.path.exists(explicit):
+            src = "--config" if path else "$TEAMBUS_CONFIG"
+            raise SystemExit("teambus: %s points at %s, which does not exist "
+                             "(refusing to fall back to another identity)" % (src, explicit))
+        candidates = [explicit]
+    else:
+        candidates = [os.path.join(os.getcwd(), "teambus.config.json"),
+                      os.path.expanduser("~/.teambus.json")]
     for cand in candidates:
-        if cand and os.path.exists(cand):
+        if os.path.exists(cand):
             with open(cand) as f:
                 cfg = json.load(f)
             cfg["_path"] = cand
@@ -132,6 +179,32 @@ def connect(cfg, write=False):
     raise last
 
 
+def api(cfg, fn, *args, fetch="all"):
+    """Call one teambus_* database function as this member. Database refusals
+    (identity, authority, state) become a clean `teambus: ...` exit."""
+    import psycopg2
+    conn = connect(cfg)
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT * FROM %s(%s)" % (fn, ", ".join(["%s"] * (len(args) + 1))),
+                    (cfg.get("member"),) + tuple(args))
+        if fetch == "one":
+            return cur.fetchone()
+        if fetch == "value":
+            row = cur.fetchone()
+            return row[0] if row else None
+        return cur.fetchall()
+    except psycopg2.errors.UndefinedFunction:
+        raise SystemExit("teambus: this database has no %s(); upgrade it with "
+                         "`python tools/migrate.py --apply` (as the owner)" % fn)
+    except psycopg2.Error as e:
+        msg = (e.diag.message_primary or str(e)).strip()
+        raise SystemExit("teambus: %s" % msg)
+    finally:
+        cur.close()
+        conn.close()
+
+
 # ---------------------------------------------------------------- helpers
 
 def member_names(cur):
@@ -156,19 +229,28 @@ def online(row, now_ts):
     return (now_ts - hb.timestamp()) <= ttl
 
 
+def whoami(cfg):
+    member, role, mode, admin = api(cfg, "teambus_whoami", fetch="one")
+    return {"member": member, "role": role, "identity_mode": mode, "admin": admin}
+
+
 # ---------------------------------------------------------------- commands
+
+def cmd_whoami(cfg):
+    w = whoami(cfg)
+    emit("whoami", w)
+    return 0
+
 
 def cmd_who(cfg):
     conn = connect(cfg)
     cur = conn.cursor()
     cur.execute("SELECT EXTRACT(EPOCH FROM now())")
     now_ts = float(cur.fetchone()[0])
-    cur.execute(
-        "SELECT m.name, m.kind, m.location, m.status, m.inbound_policy, "
-        "m.heartbeat_at, m.ttl_s, "
-        "(SELECT count(*) FROM team_messages x WHERE x.to_member = m.name "
-        " AND x.state IN ('queued','held')) AS unread "
-        "FROM team_members m ORDER BY m.name")
+    cur.execute("SELECT m.name, m.kind, m.location, m.status, m.inbound_policy, "
+                "m.heartbeat_at, m.ttl_s, m.role, u.unread "
+                "FROM team_members m LEFT JOIN teambus_unread_counts() u ON u.member = m.name "
+                "ORDER BY m.name")
     cols = [d.name for d in cur.description]
     rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     cur.close(); conn.close()
@@ -179,213 +261,129 @@ def cmd_who(cfg):
         else:
             ago = max(0, int(now_ts - r["heartbeat_at"].timestamp()))
             seen = "%ds ago" % ago if ago < 3600 else "%dm ago" % (ago // 60)
-        print("%s · %s · %s · %s · heartbeat %s · %d unread" % (
-            r["name"], r["kind"], r["location"],
-            "online" if is_on else "offline", seen, r["unread"]))
+        if OUTPUT["json"]:
+            emit("member", {"name": r["name"], "kind": r["kind"], "location": r["location"],
+                            "role": r["role"], "online": is_on, "heartbeat": seen,
+                            "inbound_policy": r["inbound_policy"], "unread": r["unread"] or 0})
+        else:
+            print("%s · %s · %s · %s · heartbeat %s · %d unread" % (
+                r["name"], r["kind"], r["location"],
+                "online" if is_on else "offline", seen, r["unread"] or 0))
     return 0
 
 
 def cmd_send(cfg, to, body, key):
-    me = cfg["member"]
     conn = connect(cfg)
     cur = conn.cursor()
-    to = resolve_recipient(cur, to)
-    if to == me:
-        raise SystemExit("teambus: cannot send to yourself")
-    cur.execute("SELECT inbound_policy FROM team_members WHERE name = %s", (to,))
-    policy = cur.fetchone()[0]
-    if policy == "refuse":
-        raise SystemExit("teambus: %s refuses inbound messages (inbound_policy=refuse)" % to)
-    state = "held" if policy == "hold" else "queued"
-    cur.execute(
-        "SELECT count(*) FROM team_messages WHERE to_member = %s AND state IN ('queued','claimed')",
-        (to,))
-    if INBOX_CAP and cur.fetchone()[0] >= INBOX_CAP:
-        raise SystemExit("teambus: %s inbox is at the %d-message unread cap; send refused"
-                         % (to, INBOX_CAP))
-    cur.execute(
-        "SELECT count(*) FROM team_messages WHERE from_member = %s AND created_at > now() - interval '1 hour'",
-        (me,))
-    if SEND_RATE_PER_HOUR and cur.fetchone()[0] >= SEND_RATE_PER_HOUR:
-        raise SystemExit("teambus: sender rate limit (%d/hour) reached; send refused"
-                         % SEND_RATE_PER_HOUR)
-    key = key or ("tb-" + uuid.uuid4().hex)
-    cur.execute(
-        "INSERT INTO team_messages (from_member, to_member, body, state, idempotency_key) "
-        "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (idempotency_key) DO NOTHING RETURNING seq",
-        (me, to, body, state, key))
-    row = cur.fetchone()
-    if row:
-        print("sent seq=%d to=%s state=%s key=%s" % (row[0], to, state, key))
-        cur.execute(
-            "SELECT heartbeat_at > now() - (ttl_s * interval '1 second') "
-            "FROM team_members WHERE name = %s", (to,))
-        live = cur.fetchone()[0]
-        if not live:
-            print("note: %s has no live listener right now; this waits until %s "
-                  "checks the bus" % (to, to))
-        poke_dispatcher()
-    else:
-        cur.execute("SELECT seq, to_member, state FROM team_messages WHERE idempotency_key = %s",
-                    (key,))
-        orig = cur.fetchone()
-        print("duplicate (idempotency key already used): original seq=%d to=%s state=%s"
-              % (orig[0], orig[1], orig[2]))
+    to = resolve_recipient(cur, to)          # friendly typo hints; the DB re-checks
     cur.close(); conn.close()
+    key = key or ("tb-" + uuid.uuid4().hex)
+    row = api(cfg, "teambus_send", to, body, key, fetch="one")
+    if not row:
+        raise SystemExit("teambus: key %s is registered but its message cannot be read" % key)
+    seq, state, duplicate, live = row
+    if duplicate:
+        print("duplicate (idempotency key already used): original seq=%s state=%s" % (seq, state))
+        return 0
+    print("sent seq=%d to=%s state=%s key=%s" % (seq, to, state, key))
+    if not live:
+        print("note: %s has no live listener right now; this waits until %s checks the bus" % (to, to))
+    poke_dispatcher()
     return 0
 
 
 def cmd_switch(cfg, member, on):
     """on/off <member>: off maps to inbound_policy=refuse, on to accept."""
-    conn = connect(cfg)
-    conn.autocommit = True
-    cur = conn.cursor()
-    cur.execute("UPDATE team_members SET inbound_policy = %s, updated_at = now() "
-                "WHERE name = %s RETURNING inbound_policy", ("accept" if on else "refuse", member))
-    row = cur.fetchone()
-    if not row:
-        raise SystemExit("teambus: no such member %s" % member)
-    print("%s inbound_policy=%s" % (member, row[0]))
-    cur.close(); conn.close()
+    pol = api(cfg, "teambus_set_policy", member, "accept" if on else "refuse", fetch="value")
+    print("%s inbound_policy=%s" % (member, pol))
     return 0
 
 
 def cmd_inbox(cfg, counts_only):
-    me = cfg["member"]
+    me = whoami(cfg)["member"]
     conn = connect(cfg)
     cur = conn.cursor()
+    # Expired claims are listed too: they are claimable again.
     cur.execute(
-        "SELECT seq, from_member, kind, state, body FROM team_messages "
-        "WHERE to_member = %s AND state IN ('queued','held') ORDER BY seq", (me,))
+        "SELECT seq, from_member, kind, "
+        "CASE WHEN state = 'claimed' THEN 'expired' ELSE state END, body, attempts "
+        "FROM team_messages WHERE to_member = %s AND (state IN ('queued','held') "
+        "OR (state = 'claimed' AND claim_lease_until < now())) ORDER BY seq", (me,))
     rows = cur.fetchall()
     cur.close(); conn.close()
     if counts_only:
-        print("TEAM_UNREAD: %d" % len(rows))
+        if OUTPUT["json"]:
+            emit("inbox-count", {"member": me, "unread": len(rows)})
+        else:
+            print("TEAM_UNREAD: %d" % len(rows))
         return 0
     if not rows:
-        print("inbox empty for %s" % me)
+        note("inbox empty for %s" % me)
         return 0
-    for seq, frm, kind, state, body in rows:
-        print('<team-message from="%s" kind="%s" id="%d" state="%s">%s</team-message>'
-              % (frm, kind, seq, state, body))
-    print("%d message(s) waiting for %s" % (len(rows), me))
+    for seq, frm, kind, state, body, attempts in rows:
+        emit("team-message", {"from": frm, "kind": kind, "id": seq, "state": state,
+                              "attempts": attempts}, body)
+    note("%d message(s) waiting for %s" % (len(rows), me))
     return 0
 
 
 def cmd_claim(cfg, frm=None, seq=None):
-    me = cfg["member"]
-    conn = connect(cfg)
-    conn.autocommit = False
-    cur = conn.cursor()
-    try:
-        # Reclaim expired leases first (crashed holders lose nothing).
-        cur.execute(
-            "UPDATE team_messages SET state='queued', claimed_by=NULL, "
-            "claim_lease_until=NULL, claimed_at=NULL WHERE to_member=%s "
-            "AND state='claimed' AND claim_lease_until < now()", (me,))
-        cur.execute(
-            "SELECT seq, from_member, kind, body FROM team_messages "
-            "WHERE to_member=%s AND state='queued' "
-            "AND (%s::text IS NULL OR from_member=%s) "
-            "AND (%s::bigint IS NULL OR seq=%s) ORDER BY seq LIMIT 1 "
-            "FOR UPDATE SKIP LOCKED", (me, frm, frm, seq, seq))
-        row = cur.fetchone()
-        if not row:
-            conn.commit()
-            print("inbox empty for %s (nothing claimable)" % me)
-            return 0
-        seq, frm, kind, body = row
-        cur.execute(
-            "UPDATE team_messages SET state='claimed', claimed_by=%s, "
-            "claimed_at=now(), claim_lease_until=now() + (%s * interval '1 minute') "
-            "WHERE seq=%s", (me, LEASE_MINUTES, seq))
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        cur.close(); conn.close()
-    print('<team-message from="%s" kind="%s" id="%d" state="claimed">%s</team-message>'
-          % (frm, kind, seq, body))
+    row = api(cfg, "teambus_claim", frm, seq, fetch="one")
+    if not row:
+        note("inbox empty for %s (nothing claimable)" % cfg.get("member"))
+        return 0
+    seq, frm, kind, body, token, until, attempt = row
+    emit("team-message", {"from": frm, "kind": kind, "id": seq, "state": "claimed",
+                          "token": str(token), "lease_until": until.isoformat(),
+                          "attempt": attempt}, body)
+    note("claimed seq=%d; finish with: done %d --token %s (renew before %s)"
+         % (seq, seq, token, until.isoformat(timespec="seconds")))
     return 0
 
 
-def cmd_done(cfg, seq):
-    me = cfg["member"]
-    conn = connect(cfg)
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE team_messages SET state='done', done_at=now() WHERE seq=%s "
-        "AND to_member=%s AND state IN ('queued','claimed') "
-        "AND (claimed_by IS NULL OR claimed_by=%s)", (seq, me, me))
-    n = cur.rowcount
-    cur.close(); conn.close()
-    if n == 0:
-        raise SystemExit("teambus: seq %s is not an open message for %s "
-                         "(already done, claimed by someone else, or not yours)"
-                         % (seq, me))
+def cmd_renew(cfg, seq, token, minutes):
+    until = api(cfg, "teambus_renew", seq, token, minutes, fetch="value")
+    print("renewed seq=%d until %s" % (seq, until.isoformat(timespec="seconds")))
+    return 0
+
+
+def cmd_done(cfg, seq, token=None):
+    api(cfg, "teambus_done", seq, token, fetch="value")
     print("done seq=%d" % seq)
     return 0
 
 
-def cmd_heartbeat(cfg):
-    me = cfg["member"]
-    conn = connect(cfg)
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE team_members SET heartbeat_at=now(), status='online', "
-        "updated_at=now() WHERE name=%s", (me,))
-    n = cur.rowcount
-    cur.close(); conn.close()
-    if n == 0:
-        raise SystemExit("teambus: '%s' is not on the roster" % me)
-    print("heartbeat ok for %s" % me)
+def cmd_fail(cfg, seq, token, reason):
+    st = api(cfg, "teambus_fail", seq, token, reason, fetch="value")
+    print("seq=%d returned as %s" % (seq, st))
     return 0
 
 
-# ---------------------------------------------------------------- main
+def cmd_release(cfg, seq):
+    st = api(cfg, "teambus_release", seq, fetch="value")
+    print("released seq=%d -> %s" % (seq, st))
+    return 0
+
+
+def cmd_heartbeat(cfg):
+    api(cfg, "teambus_heartbeat", None, None, fetch="value")
+    print("heartbeat ok for %s" % cfg.get("member"))
+    return 0
+
 
 def cmd_fact(cfg, key, body, directive, idem):
-    """Post to the facts board. Exact text is stored verbatim. Posting an
-    existing key supersedes its current row in the same transaction, so
-    the board is never ambiguous about which version is live."""
-    me = cfg["member"]
+    """Post to the facts board. Text is stored verbatim. Posting an existing key
+    supersedes its current row atomically; the database guarantees one current
+    row per key."""
     kind = "directive" if directive else "fact"
     idem = idem or ("tbf-" + uuid.uuid4().hex)
-    conn = connect(cfg)
-    conn.autocommit = False
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "SELECT id FROM team_facts WHERE idempotency_key = %s", (idem,))
-        dup = cur.fetchone()
-        if dup:
-            conn.commit()
-            print("duplicate (idempotency key already used): original fact id=%d"
-                  % dup[0])
-            return 0
-        cur.execute(
-            "SELECT id FROM team_facts WHERE key = %s AND superseded_by IS NULL "
-            "FOR UPDATE", (key,))
-        prev = cur.fetchone()
-        cur.execute(
-            "INSERT INTO team_facts (key, kind, body, posted_by, idempotency_key, "
-            "supersedes) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
-            (key, kind, body, me, idem, prev[0] if prev else None))
-        new_id = cur.fetchone()[0]
-        if prev:
-            cur.execute(
-                "UPDATE team_facts SET superseded_by = %s WHERE id = %s",
-                (new_id, prev[0]))
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        cur.close(); conn.close()
+    new_id, prev, duplicate = api(cfg, "teambus_post_fact", key, kind, body, idem, fetch="one")
+    if duplicate:
+        print("duplicate (idempotency key already used): original fact id=%s" % new_id)
+        return 0
     poke_dispatcher()
     print("fact posted id=%d key=%s kind=%s%s"
-          % (new_id, key, kind, " (supersedes %d)" % prev[0] if prev else ""))
+          % (new_id, key, kind, " (supersedes %d)" % prev if prev else ""))
     return 0
 
 
@@ -394,8 +392,7 @@ RETIRED_PREFIX = "RETIRED: "
 
 def cmd_retire(cfg, key, reason):
     """Supersede a finished fact with a RETIRED tombstone. Readers hide it from
-    the board; `facts <key>` still shows the full history. No schema change,
-    and readers that do not know the convention just see the tombstone text."""
+    the board; `facts <key>` still shows the full history."""
     conn = connect(cfg)
     cur = conn.cursor()
     cur.execute("SELECT body FROM team_facts WHERE key = %s AND superseded_by IS NULL", (key,))
@@ -414,15 +411,10 @@ def cmd_retire(cfg, key, reason):
 # archive twin inside the same statement, so a failure moves nothing.
 
 MSG_COLS = ("seq, from_member, to_member, body, kind, state, idempotency_key, claimed_by, "
-            "claim_lease_until, created_at, claimed_at, done_at")
+            "claim_lease_until, created_at, claimed_at, done_at, claim_token, attempts, last_error, releases")
 FACT_COLS = "id, key, kind, body, posted_by, idempotency_key, supersedes, superseded_by, created_at"
 
-# Done mail whose finish (or, failing that, creation) is older than the cutoff.
 MSG_WHERE = "state = 'done' AND COALESCE(done_at, created_at) < %(cutoff)s"
-# A superseded fact moves once it AND its successor are older than the cutoff
-# (the successor may already be archived). A RETIRED tombstone that is the
-# current head moves once it is older than the cutoff, taking its key off the
-# hot table; `history <key>` still shows it.
 FACT_WHERE = """(
   (f.superseded_by IS NOT NULL AND f.created_at < %(cutoff)s AND
    COALESCE((SELECT s.created_at FROM team_facts s WHERE s.id = f.superseded_by),
@@ -430,6 +422,15 @@ FACT_WHERE = """(
   OR
   (f.superseded_by IS NULL AND f.body LIKE %(retired)s AND f.created_at < %(cutoff)s)
 )"""
+
+
+class ExportError(RuntimeError):
+    """The archive move committed, but the export file could not be finished.
+    The prepared export is kept at .path; nothing was lost."""
+
+    def __init__(self, msg, path, result):
+        super().__init__(msg)
+        self.path, self.result = path, result
 
 
 def parse_age(text):
@@ -444,18 +445,22 @@ def parse_age(text):
 def compact(conn, older_than, dry_run=False, export_path=None):
     """Move old finished rows into the archive tables in one transaction.
     Returns {'messages': n, 'facts': n, 'dry_run': bool, 'cutoff': iso}.
-    Idempotent: a second run with the same cutoff finds nothing to move."""
+    Idempotent: a second run with the same cutoff finds nothing to move.
+    Delivered wake bookkeeping older than the cutoff is pruned (it is a hint
+    log, not a record). The idempotency registry is never touched.
+    If the export cannot be finalized after the commit, raises ExportError and
+    keeps the prepared file at <export>.partial."""
     import datetime as _dt
     cutoff = _dt.datetime.now(_dt.timezone.utc) - older_than
     params = {"cutoff": cutoff, "retired": RETIRED_PREFIX + "%"}
     conn.autocommit = False
     cur = conn.cursor()
+    committed = False
+    partial = export_path + ".partial" if export_path else None
     try:
         cur.execute("SELECT to_regclass('team_messages_archive'), to_regclass('team_facts_archive')")
         if None in cur.fetchone():
-            raise SystemExit("teambus: archive tables missing; run tools/migrate_archive.py --apply first")
-        # Hold off new fact posts for the few ms the move takes, so no head is
-        # superseded while its chain is being moved.
+            raise SystemExit("teambus: archive tables missing; run tools/migrate.py --apply first")
         cur.execute("LOCK TABLE team_facts IN SHARE ROW EXCLUSIVE MODE")
         if dry_run:
             cur.execute("SELECT count(*) FROM team_messages WHERE " + MSG_WHERE, params)
@@ -475,17 +480,30 @@ def compact(conn, older_than, dry_run=False, export_path=None):
             "INSERT INTO team_facts_archive (" + FACT_COLS + ") SELECT " + FACT_COLS + " FROM moved "
             "RETURNING " + FACT_COLS, params)
         frows = cur.fetchall()
+        cur.execute("SELECT to_regclass('team_wake_deliveries')")
+        if cur.fetchone()[0]:
+            cur.execute("DELETE FROM team_wake_deliveries WHERE status IN ('delivered','skipped') "
+                        "AND COALESCE(delivered_at, created_at) < %(cutoff)s", params)
         tmp = None
         if export_path and (mrows or frows):
-            tmp = _write_export(export_path + ".partial", mrows, frows, cutoff)
+            tmp = _write_export(partial, mrows, frows, cutoff)
         conn.commit()
+        committed = True
+        result = {"messages": len(mrows), "facts": len(frows), "dry_run": False,
+                  "cutoff": cutoff.isoformat()}
         if tmp:
-            os.replace(tmp, export_path)
-        return {"messages": len(mrows), "facts": len(frows), "dry_run": False, "cutoff": cutoff.isoformat()}
+            try:
+                os.replace(tmp, export_path)
+            except OSError as e:
+                raise ExportError("archive committed (%d message(s), %d fact(s)) but the export could "
+                                  "not be moved into place: %s; the full export is kept at %s"
+                                  % (len(mrows), len(frows), e, tmp), tmp, result)
+        return result
     except BaseException:
-        conn.rollback()
-        if export_path and os.path.exists(export_path + ".partial"):
-            os.remove(export_path + ".partial")
+        if not committed:
+            conn.rollback()
+            if partial and os.path.exists(partial):
+                os.remove(partial)
         raise
     finally:
         cur.close()
@@ -510,6 +528,8 @@ def cmd_compact(cfg, age, dry_run, export):
     conn = connect(cfg, write=True)
     try:
         r = compact(conn, parse_age(age), dry_run, export)
+    except ExportError as e:
+        raise SystemExit("teambus: %s" % e)
     finally:
         conn.close()
     verb = "would archive" if r["dry_run"] else "archived"
@@ -522,7 +542,8 @@ def cmd_compact(cfg, age, dry_run, export):
 
 
 def history(conn, target, limit=200):
-    """Full trace for a member (mail to/from) or a fact key, hot + archive."""
+    """Full trace for a member (mail to/from) or a fact key, hot + archive.
+    Row security limits mail to what the caller may read."""
     cur = conn.cursor()
     cur.execute("SELECT 1 FROM team_members WHERE name = %s", (target,))
     is_member = cur.fetchone() is not None
@@ -555,19 +576,18 @@ def cmd_history(cfg, target, limit):
     finally:
         conn.close()
     if not rows:
-        print("no history for '%s'" % target)
+        note("no history for '%s'" % target)
         return 0
     for r in rows:
         if r[0] == "message":
             _, seq, frm, to, state, at, done, body, where = r
-            print('<message seq="%d" from="%s" to="%s" state="%s" at="%s" in="%s">%s</message>'
-                  % (seq, frm, to, state, at, where, body))
+            emit("message", {"seq": seq, "from": frm, "to": to, "state": state, "at": at, "in": where}, body)
         else:
             _, fid, key, kind, by, at, sup, body, where = r
             state = "current" if sup is None else "superseded by %d" % sup
-            print('<fact id="%d" key="%s" kind="%s" by="%s" at="%s" state="%s" in="%s">%s</fact>'
-                  % (fid, key, kind, by, at, state, where, body))
-    print("%d row(s), newest first" % len(rows))
+            emit("fact", {"id": fid, "key": key, "kind": kind, "by": by, "at": at,
+                          "state": state, "in": where}, body)
+    note("%d row(s), newest first" % len(rows))
     return 0
 
 
@@ -581,12 +601,11 @@ def cmd_facts(cfg, key):
         rows = cur.fetchall()
         cur.close(); conn.close()
         if not rows:
-            print("no fact with key '%s'" % key)
+            note("no fact with key '%s'" % key)
             return 0
         for fid, k, kind, body, by, at, sup in rows:
             state = "current" if sup is None else "superseded by %d" % sup
-            print('<fact id="%d" key="%s" kind="%s" by="%s" at="%s" state="%s">%s</fact>'
-                  % (fid, k, kind, by, at, state, body))
+            emit("fact", {"id": fid, "key": k, "kind": kind, "by": by, "at": at, "state": state}, body)
         return 0
     cur.execute(
         "SELECT id, key, kind, body, posted_by, created_at FROM team_facts "
@@ -595,38 +614,24 @@ def cmd_facts(cfg, key):
     rows = cur.fetchall()
     cur.close(); conn.close()
     if not rows:
-        print("facts board is empty")
+        note("facts board is empty")
         return 0
     for fid, k, kind, body, by, at in rows:
-        print('<fact id="%d" key="%s" kind="%s" by="%s" at="%s">%s</fact>'
-              % (fid, k, kind, by, at, body))
-    print("%d current fact(s) on the board" % len(rows))
+        emit("fact", {"id": fid, "key": k, "kind": kind, "by": by, "at": at}, body)
+    note("%d current fact(s) on the board" % len(rows))
     return 0
 
 
 def cmd_task_add(cfg, owner, title):
-    conn = connect(cfg)
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM team_members WHERE name = %s", (owner,))
-    if not cur.fetchone():
-        raise SystemExit("teambus: '%s' is not on the roster" % owner)
-    cur.execute("INSERT INTO team_tasks (title, owner, created_by) VALUES (%s, %s, %s) RETURNING id",
-                (title, owner, cfg["member"]))
-    tid = cur.fetchone()[0]
-    conn.commit(); cur.close(); conn.close()
+    tid = api(cfg, "teambus_task_add", owner, title, fetch="value")
     print("task #%d added for %s" % (tid, owner))
     return 0
 
 
-def cmd_task_done(cfg, tid, note):
-    conn = connect(cfg)
-    cur = conn.cursor()
-    cur.execute("UPDATE team_tasks SET status = 'done', done_at = now(), done_by = %s, "
-                "note = COALESCE(%s, note) WHERE id = %s AND status = 'open' RETURNING title",
-                (cfg["member"], note, tid))
-    row = cur.fetchone()
-    conn.commit(); cur.close(); conn.close()
-    print(("task #%d done: %s" % (tid, row[0])) if row else ("no open task #%d" % tid))
+def cmd_task_done(cfg, tid, note_text):
+    title = api(cfg, "teambus_task_done", tid, note_text, fetch="value")
+    print(("task #%d done: %s" % (tid, title)) if title
+          else ("no open task #%d that you may close" % tid))
     return 0
 
 
@@ -638,26 +643,40 @@ def cmd_tasks(cfg, owner, show_all):
                 "ORDER BY status, id", (owner, owner, show_all))
     rows = cur.fetchall()
     cur.close(); conn.close()
-    for tid, own, title, by, status, at, done_by, note in rows:
-        print('<task id="%d" owner="%s" by="%s" status="%s" at="%s"%s>%s%s</task>'
-              % (tid, own, by, status, at, ' done_by="%s"' % done_by if done_by else '',
-                 title, (' [note: %s]' % note) if note else ''))
-    print("%d task(s)" % len(rows))
+    for tid, own, title, by, status, at, done_by, note_text in rows:
+        emit("task", {"id": tid, "owner": own, "by": by, "status": status, "at": at,
+                      "done_by": done_by, "note": note_text}, title)
+    note("%d task(s)" % len(rows))
     return 0
+
+
+# ---------------------------------------------------------------- main
+
+def _take(rest, flag, conv=str):
+    """Remove `flag VALUE` from rest and return VALUE (or None)."""
+    if flag not in rest:
+        return None
+    i = rest.index(flag)
+    if i + 1 >= len(rest):
+        raise SystemExit("teambus: %s needs a value" % flag)
+    val = rest[i + 1]
+    del rest[i:i + 2]
+    return conv(val)
 
 
 def main(argv):
     args = list(argv)
-    cfg_path = None
-    if "--config" in args:
-        i = args.index("--config")
-        cfg_path = args[i + 1]
-        del args[i:i + 2]
+    cfg_path = _take(args, "--config")
+    OUTPUT["json"] = "--json" in args
+    if OUTPUT["json"]:
+        args.remove("--json")
     if not args:
         print(__doc__)
         return 2
     cfg = load_config(cfg_path)
     cmd, rest = args[0], args[1:]
+    if cmd == "whoami":
+        return cmd_whoami(cfg)
     if cmd == "who":
         return cmd_who(cfg)
     if cmd == "heartbeat":
@@ -665,19 +684,28 @@ def main(argv):
     if cmd == "inbox":
         return cmd_inbox(cfg, counts_only="--counts" in rest)
     if cmd == "claim":
-        frm = rest[rest.index("--from") + 1] if "--from" in rest else None
-        seq = int(rest[rest.index("--seq") + 1]) if "--seq" in rest else None
-        return cmd_claim(cfg, frm, seq)
+        return cmd_claim(cfg, _take(rest, "--from"), _take(rest, "--seq", int))
+    if cmd == "renew":
+        token, minutes = _take(rest, "--token"), _take(rest, "--minutes", int)
+        if len(rest) != 1 or not token:
+            raise SystemExit("usage: teambus.py renew <seq> --token T [--minutes N]")
+        return cmd_renew(cfg, int(rest[0]), token, minutes)
     if cmd == "done":
+        token = _take(rest, "--token")
         if len(rest) != 1:
-            raise SystemExit("usage: teambus.py done <seq>")
-        return cmd_done(cfg, int(rest[0]))
+            raise SystemExit("usage: teambus.py done <seq> [--token T]")
+        return cmd_done(cfg, int(rest[0]), token)
+    if cmd == "fail":
+        token = _take(rest, "--token")
+        if len(rest) < 2 or not token:
+            raise SystemExit("usage: teambus.py fail <seq> --token T <reason...>")
+        return cmd_fail(cfg, int(rest[0]), token, " ".join(rest[1:]))
+    if cmd == "release":
+        if len(rest) != 1:
+            raise SystemExit("usage: teambus.py release <seq>")
+        return cmd_release(cfg, int(rest[0]))
     if cmd == "send":
-        key = None
-        if "--key" in rest:
-            i = rest.index("--key")
-            key = rest[i + 1]
-            del rest[i:i + 2]
+        key = _take(rest, "--key")
         if len(rest) < 2:
             raise SystemExit("usage: teambus.py send <member> <body...> [--key K]")
         return cmd_send(cfg, rest[0], " ".join(rest[1:]), key)
@@ -685,11 +713,7 @@ def main(argv):
         directive = "--directive" in rest
         if directive:
             rest.remove("--directive")
-        idem = None
-        if "--key" in rest:
-            i = rest.index("--key")
-            idem = rest[i + 1]
-            del rest[i:i + 2]
+        idem = _take(rest, "--key")
         if len(rest) < 2:
             raise SystemExit("usage: teambus.py fact [--directive] <key> <body...> [--key IDEM]")
         return cmd_fact(cfg, rest[0], " ".join(rest[1:]), directive, idem)
@@ -709,21 +733,15 @@ def main(argv):
         owner = next((a for a in rest if not a.startswith("--")), None)
         return cmd_tasks(cfg, owner, "--all" in rest)
     if cmd == "compact":
-        if "--older-than" not in rest:
+        age = _take(rest, "--older-than")
+        if not age:
             raise SystemExit("usage: teambus.py compact --older-than 90d [--dry-run] [--export FILE.jsonl.gz]")
-        age = rest[rest.index("--older-than") + 1]
-        export = rest[rest.index("--export") + 1] if "--export" in rest else None
-        return cmd_compact(cfg, age, "--dry-run" in rest, export)
+        return cmd_compact(cfg, age, "--dry-run" in rest, _take(rest, "--export"))
     if cmd == "history":
-        limit = 200
-        args = list(rest)
-        if "--limit" in args:
-            i = args.index("--limit")
-            limit = int(args[i + 1])
-            del args[i:i + 2]
-        if len(args) != 1:
+        limit = _take(rest, "--limit", int) or 200
+        if len(rest) != 1:
             raise SystemExit("usage: teambus.py history <member|key> [--limit N]")
-        return cmd_history(cfg, args[0], limit)
+        return cmd_history(cfg, rest[0], limit)
     if cmd == "retire":
         if len(rest) < 2:
             raise SystemExit("usage: teambus.py retire <key> <reason...>")

@@ -1,6 +1,9 @@
 {
   "teambus_config": "teambus.config.json",
   "poll_interval_s": 2,
+  "max_idle_s": 600,
+  "heartbeat_interval_s": 300,
+  "max_wake_attempts": 12,
   "members": {
     "alice": {"notice_file": true},
     "bob": {"command": ["notify-send", "Team Bus", "new mail for bob"]}
