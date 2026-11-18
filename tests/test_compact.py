@@ -24,7 +24,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 import teambus  # noqa: E402
-import migrate_archive  # noqa: E402
+import migrate  # noqa: E402
 
 try:
     import psycopg2
@@ -32,7 +32,7 @@ except ImportError:  # pragma: no cover
     psycopg2 = None
 
 # The pre-archive schema an existing install has (supersedes still a foreign
-# key), so these tests also prove tools/migrate_archive.py upgrades it.
+# key), so these tests also prove tools/migrate.py upgrades it.
 BASE_SQL = """
 CREATE TABLE team_members (
   name text PRIMARY KEY, kind text NOT NULL, location text NOT NULL, machine text,
@@ -89,6 +89,13 @@ def setUpModule():
                    stop=[exe("pg_ctl"), "-D", data, "-m", "fast", "-w", "stop"], dir=d)
 
 
+def _drop_db(name):
+    conn = psycopg2.connect(_server["admin"])
+    conn.autocommit = True
+    conn.cursor().execute("DROP DATABASE IF EXISTS " + name + " WITH (FORCE)")
+    conn.close()
+
+
 def tearDownModule():
     if "stop" in _server:
         subprocess.run(_server["stop"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -115,6 +122,7 @@ class CompactTests(unittest.TestCase):
         self.admin = psycopg2.connect(_server["admin"])
         self.admin.autocommit = True
         self.admin.cursor().execute("CREATE DATABASE " + self.name)
+        self.addCleanup(_drop_db, self.name)   # also runs when setUp fails
         self.dsn = _with_db(_server["admin"], self.name)
         self.conn = psycopg2.connect(self.dsn)
         self.conn.autocommit = True
@@ -140,24 +148,35 @@ class CompactTests(unittest.TestCase):
                         (f, t, "msg %d" % i, st, "k%d" % i, c, dn, t if st == "claimed" else None))
 
         def fact(key, body, at):
+            # Raw SQL with back-dated rows. The v0.2 schema enforces one head per
+            # key, so retire the old head first (deferred FK) before inserting.
             cur.execute("SELECT id FROM team_facts WHERE key=%s AND superseded_by IS NULL", (key,))
             prev = cur.fetchone()
-            cur.execute("INSERT INTO team_facts (key,body,posted_by,idempotency_key,supersedes,created_at) "
-                        "VALUES (%s,%s,'alice',%s,%s,%s) RETURNING id",
-                        (key, body, os.urandom(6).hex(), prev[0] if prev else None, at))
+            cur.execute("SELECT nextval(pg_get_serial_sequence('team_facts','id'))")
             nid = cur.fetchone()[0]
-            if prev:
-                cur.execute("UPDATE team_facts SET superseded_by=%s WHERE id=%s", (nid, prev[0]))
+            if self.schema == "legacy":
+                cur.execute("INSERT INTO team_facts (id,key,body,posted_by,idempotency_key,supersedes,created_at) "
+                            "VALUES (%s,%s,%s,'alice',%s,%s,%s)",
+                            (nid, key, body, os.urandom(6).hex(), prev[0] if prev else None, at))
+                if prev:
+                    cur.execute("UPDATE team_facts SET superseded_by=%s WHERE id=%s", (nid, prev[0]))
+                return
+            cur.execute("BEGIN; SET CONSTRAINTS team_facts_superseded_by_fkey DEFERRED;"
+                        "UPDATE team_facts SET superseded_by=%s WHERE id=%s;"
+                        "INSERT INTO team_facts (id,key,body,posted_by,idempotency_key,supersedes,created_at) "
+                        "VALUES (%s,%s,%s,'alice',%s,%s,%s); COMMIT;",
+                        (nid, prev[0] if prev else -1, nid, key, body, os.urandom(6).hex(),
+                         prev[0] if prev else None, at))
         fact("alpha", "a1", OLD); fact("alpha", "a2", MID); fact("alpha", "a3 current", NEW)
         fact("beta", "b1", OLD); fact("beta", "b2", OLD)
         fact("gamma", "g1", OLD); fact("gamma", teambus.RETIRED_PREFIX + "done", MID)
         fact("delta", "d1", NEW); fact("delta", teambus.RETIRED_PREFIX + "fresh", NEW)
-        migrate_archive.apply(self.conn)
+        migrate.apply(self.conn)
         self.tmp = tempfile.mkdtemp(prefix="tbcfg-")
 
     def tearDown(self):
         self.conn.close()
-        self.admin.cursor().execute("DROP DATABASE " + self.name + " WITH (FORCE)")
+        self.admin.cursor().execute("DROP DATABASE IF EXISTS " + self.name + " WITH (FORCE)")
         self.admin.close()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -225,7 +244,7 @@ class CompactTests(unittest.TestCase):
         cur = self.conn.cursor()
         cur.execute("SELECT " + teambus.MSG_COLS + " FROM team_messages WHERE body='msg 0'")
         cur.execute("INSERT INTO team_messages_archive (" + teambus.MSG_COLS + ") VALUES (" +
-                    ",".join(["%s"] * 12) + ")", cur.fetchone())  # PK clash mid-move
+                    ",".join(["%s"] * len(teambus.MSG_COLS.split(","))) + ")", cur.fetchone())  # PK clash mid-move
         before = self.hot()
         with self.assertRaises(psycopg2.IntegrityError):
             teambus.compact(self.conn, AGE)
@@ -276,7 +295,7 @@ class CompactTests(unittest.TestCase):
 
     def test_missing_archive_tables_refuse(self):
         self.conn.cursor().execute("DROP TABLE team_messages_archive")
-        with self.assertRaisesRegex(SystemExit, "migrate_archive"):
+        with self.assertRaisesRegex(SystemExit, "tools/migrate.py"):
             teambus.compact(self.conn, AGE)
 
 

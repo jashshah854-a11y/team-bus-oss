@@ -5,7 +5,7 @@ Thanks for helping. Team Bus is small on purpose, so the best contributions keep
 ## Ground rules
 
 - Open an issue before a large change, so we can agree on the shape first.
-- Keep the core rules intact: identity comes from config, never from arguments; reading never deletes; the facts board supersedes and never edits.
+- Keep the core rules intact: identity comes from the database login, never from arguments or config; writes go through `api.sql`; reading never deletes; the facts board supersedes and never edits.
 - Never commit credentials, DSNs, `.pgpass` contents, hostnames or member configs. Use placeholders.
 
 ## Development setup
@@ -18,6 +18,14 @@ pip install psycopg2-binary
 ```
 
 Point a `pg-dsn` config at a throwaway Postgres database (Docker works well) and follow the README quickstart.
+
+Run the tests against a throwaway server where the user may create databases and roles:
+
+```bash
+TEAMBUS_TEST_DSN="host=localhost port=5432 user=postgres password=... dbname=postgres" python -m unittest discover -s tests -v
+```
+
+Database tests skip when neither `TEAMBUS_TEST_DSN` nor `TEAMBUS_PG_BIN` is set. A change to `api.sql` needs a test that connects as a restricted member login (`tests/pgtools.py`), not as the owner, because the owner bypasses row security.
 
 ## Pull requests
 

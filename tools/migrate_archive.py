@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Archive tables for `teambus.py compact` (2026-11-10).
 
+Superseded by tools/migrate.py, which runs this step and the v0.2
+migration together. Kept for installs that only want the archive.
+
 Prints the migration by default. `--apply` runs it against the configured bus.
 Run --apply once per database, as the owner; review the printed SQL first.
 
