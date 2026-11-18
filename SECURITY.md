@@ -26,7 +26,7 @@ Not covered: a stolen database password (rotate it), the database owner (who can
 
 ## Install requirement
 
-Schema `public` must not be writable by every role (`REVOKE CREATE ON SCHEMA public FROM PUBLIC`; the default since PostgreSQL 15, but not on 13/14 or on clusters upgraded from them). `schema.sql`, `api.sql` and `tools/migrate.py` refuse to run otherwise, and refuse if a bus table already exists under another owner. Do not grant CREATE on `public` to member logins afterwards: a role that can create objects there could plant overloads or triggers that the bus's own code runs.
+No bus role (PUBLIC, `teambus_agent`, or a member's login) may have CREATE on schema `public` or on the database (`REVOKE CREATE ON SCHEMA public FROM PUBLIC`; PostgreSQL 15+ already withholds it from PUBLIC, 13/14 and upgraded clusters do not). `schema.sql`, `api.sql` and `tools/migrate.py` refuse to run otherwise, and refuse if a bus table already exists under another owner. Do not grant those privileges to member logins afterwards: a role that can create objects could plant overloads, triggers or a shadowing schema that the bus's own code would use. As a second layer, every client connection pins `search_path` to `pg_catalog, public`.
 
 ## Design notes that matter for security
 

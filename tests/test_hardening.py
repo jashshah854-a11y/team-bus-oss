@@ -371,6 +371,39 @@ class ReviewRegressionTests(Base):
             cur.execute("SELECT * FROM teambus_post_fact('alice', %s, 'fact', 'B', 'same-idem')", ("k" + sep + "fact",))
         conn.close()
 
+    def test_a_user_named_schema_cannot_shadow_bus_tables_at_runtime(self):
+        # Granted after install (the preflight refuses it at install time).
+        self.bus.sql("GRANT CREATE ON DATABASE %s TO teambus_agent" % self.bus.name)
+        self.cli("boss", "send", "bob", "SECRET for bob")
+        conn = self.bus.connect_as("alice")
+        cur = conn.cursor()
+        relay_login = self.bus.tag + "_relay"
+        cur.execute('CREATE SCHEMA "%s"' % relay_login)
+        cur.execute('CREATE TABLE "%s".team_wake_deliveries (LIKE public.team_wake_deliveries INCLUDING ALL)'
+                    % relay_login)
+        cur.execute('GRANT ALL ON SCHEMA "%s" TO PUBLIC; GRANT ALL ON "%s".team_wake_deliveries TO PUBLIC'
+                    % (relay_login, relay_login))
+        cur.execute("CREATE SCHEMA postgres")                    # the owner's "$user" in these tests
+        cur.execute("CREATE TABLE postgres.team_messages_archive (LIKE public.team_messages_archive)")
+        cur.execute("GRANT ALL ON SCHEMA postgres TO PUBLIC; GRANT ALL ON postgres.team_messages_archive TO PUBLIC")
+        conn.close()
+        import dispatcher
+        from unittest import mock
+        d = dispatcher.Dispatcher(dict(dispatcher.DEFAULTS, teambus_config=self.cfg["relay"], _path="t",
+                                       spool_dir=os.path.join(self.bus.tmp, "spool"),
+                                       poke_path=os.path.join(self.bus.tmp, "poke"),
+                                       state_path=os.path.join(self.bus.tmp, "st.json"),
+                                       log_path=os.path.join(self.bus.tmp, "log.jsonl")))
+        with mock.patch("builtins.print"):
+            d.cycle()
+        self.assertEqual(self.bus.sql("SELECT count(*) FROM public.team_wake_deliveries")[0][0], 1)
+        self.assertEqual(self.bus.sql('SELECT count(*) FROM "%s".team_wake_deliveries' % relay_login)[0][0], 0)
+        # Compaction through the owner's own connection still archives into public.
+        self.bus.sql("UPDATE team_messages SET state = 'done', done_at = now() - interval '200 days'")
+        self.assertEqual(teambus.compact(self.bus.conn, dt.timedelta(days=90))["messages"], 1)
+        self.assertEqual(self.bus.sql("SELECT count(*) FROM public.team_messages_archive")[0][0], 1)
+        self.assertEqual(self.bus.sql("SELECT count(*) FROM postgres.team_messages_archive")[0][0], 0)
+
     def test_deadman_refuses_to_run_blind(self):
         import teambus_deadman
         with self.assertRaisesRegex(RuntimeError, "cannot read all mail"):
@@ -466,8 +499,22 @@ class MigrationTests(unittest.TestCase):
             b.sql("GRANT CREATE ON SCHEMA public TO PUBLIC")
             with self.assertRaisesRegex(psycopg2.Error, "REVOKE CREATE ON SCHEMA public FROM PUBLIC"):
                 migrate.apply(b.conn)
-            with self.assertRaisesRegex(psycopg2.Error, "every role may CREATE"):
+            with self.assertRaisesRegex(psycopg2.Error, "role public may CREATE in schema public"):
                 b.sql((ROOT / "schema.sql").read_text(encoding="utf-8"))
+        finally:
+            b.close()
+
+    def test_preflight_refuses_create_granted_to_a_bus_role(self):
+        b = pgtools.Bus({"alice": "member"})
+        try:
+            api_sql = (ROOT / "api.sql").read_text(encoding="utf-8")
+            b.sql("GRANT CREATE ON SCHEMA public TO teambus_agent")
+            with self.assertRaisesRegex(psycopg2.Error, "role teambus_agent may CREATE in schema public"):
+                b.sql(api_sql)
+            b.sql("REVOKE CREATE ON SCHEMA public FROM teambus_agent")
+            b.sql("GRANT CREATE ON DATABASE %s TO %s" % (b.name, b.tag + "_alice"))
+            with self.assertRaisesRegex(psycopg2.Error, "may CREATE schemas in this database"):
+                b.sql(api_sql)
         finally:
             b.close()
 

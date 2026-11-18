@@ -37,7 +37,7 @@ pip install psycopg2-binary
 
 ## Quickstart (about 10 minutes)
 
-1. **Create the tables and the database API** as the database owner. Schema `public` must not be writable by every role (the default since PostgreSQL 15; on older clusters run `REVOKE CREATE ON SCHEMA public FROM PUBLIC` first). The scripts refuse to run otherwise.
+1. **Create the tables and the database API** as the database owner. Member logins must not be able to create objects: no CREATE on schema `public` (the default for PUBLIC since PostgreSQL 15; on older clusters run `REVOKE CREATE ON SCHEMA public FROM PUBLIC` first) and no CREATE on the database. The scripts refuse to run otherwise (see SECURITY.md).
 
    ```bash
    psql "$OWNER_URL" -f schema.sql -f api.sql

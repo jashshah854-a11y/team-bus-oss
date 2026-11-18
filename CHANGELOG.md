@@ -12,7 +12,7 @@ All notable changes to this project are listed here. The format follows [Keep a 
 - An explicit `--config` or `$TEAMBUS_CONFIG` pointing at a missing file is an error instead of a silent fallback to another identity.
 - The dispatcher refuses member names that would put a spool file outside `spool_dir`.
 - Every `SECURITY DEFINER` function runs with `search_path = pg_catalog, pg_temp` and schema-qualified names, so overloads planted in a writable `public` schema (the PG13/14 default) cannot run as the owner. `tools/migrate.py` warns when `public` is writable by everyone or a mapped login bypasses row security.
-- `schema.sql`, `api.sql` and `tools/migrate.py` refuse to run when schema `public` is writable by every role, or when a bus table already exists under another owner, so no login can plant tables, triggers or overloads that the owner's code runs. Client queries cast numeric parameters explicitly.
+- `schema.sql`, `api.sql` and `tools/migrate.py` refuse to run when a bus role may CREATE in schema `public` or in the database, or when a bus table already exists under another owner, so no login can plant tables, triggers, overloads or a shadowing schema that the owner's code runs. Client connections, compaction and migration pin `search_path` to `pg_catalog, public`; client queries cast numeric parameters explicitly.
 - Only an owner may replace or retire a current directive.
 - Removed the `release-bootstrap` workflow, which force-pushed `main` from an archive that no longer exists.
 

@@ -67,6 +67,11 @@ POKE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state", "p
 
 OUTPUT = {"json": False}
 
+# Every connection resolves names in pg_catalog and public only: never in a
+# "$user" schema that someone else could create to shadow the bus tables.
+SEARCH_PATH = "pg_catalog, public, pg_temp"
+SEARCH_PATH_OPT = "-c search_path=pg_catalog,public,pg_temp"
+
 
 def poke_dispatcher():
     """Best-effort wake for the local dispatcher; never fails a send."""
@@ -156,9 +161,9 @@ def _connect_once(cfg):
                       keepalives_interval=10, keepalives_count=3)
         if db.get("sslnegotiation"):
             kwargs["sslnegotiation"] = db["sslnegotiation"]
-        return psycopg2.connect(**kwargs)
+        return psycopg2.connect(options=SEARCH_PATH_OPT, **kwargs)
     if transport == "pg-dsn":
-        return psycopg2.connect(db["dsn"], connect_timeout=20,
+        return psycopg2.connect(db["dsn"], options=SEARCH_PATH_OPT, connect_timeout=20,
                                 keepalives=1, keepalives_idle=30)
     raise RuntimeError("unknown db.transport: %s" % transport)
 
@@ -458,6 +463,7 @@ def compact(conn, older_than, dry_run=False, export_path=None):
     committed = False
     partial = export_path + ".partial" if export_path else None
     try:
+        cur.execute("SET LOCAL search_path = " + SEARCH_PATH)   # callers may pass their own conn
         cur.execute("SELECT to_regclass('team_messages_archive'), to_regclass('team_facts_archive')")
         if None in cur.fetchone():
             raise SystemExit("teambus: archive tables missing; run tools/migrate.py --apply first")

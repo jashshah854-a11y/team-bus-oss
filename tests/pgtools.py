@@ -95,6 +95,14 @@ class Bus:
         cur.execute("CREATE DATABASE " + self.name)
         a.close()
         self.dsn = _replace(_server["admin"], dbname=self.name)
+        self.conn = None
+        try:
+            self._build(members, legacy_sql)
+        except BaseException:
+            self.close()                 # never leak a database or roles
+            raise
+
+    def _build(self, members, legacy_sql):
         self.conn = psycopg2.connect(self.dsn)
         self.conn.autocommit = True
         cur = self.conn.cursor()
@@ -154,7 +162,8 @@ class Bus:
             cur.close()
 
     def close(self):
-        self.conn.close()
+        if self.conn is not None:
+            self.conn.close()
         a = admin()
         cur = a.cursor()
         cur.execute("DROP DATABASE IF EXISTS " + self.name + " WITH (FORCE)")

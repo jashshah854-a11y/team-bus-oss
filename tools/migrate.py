@@ -4,8 +4,9 @@
 Prints the plan by default. `--apply` runs everything in ONE transaction
 against the configured bus, as the database owner: a failure changes nothing.
 
-  0. preflight                      refuses if schema public is writable by
-                                    everyone or a bus table has a foreign owner
+  0. preflight                      refuses if a bus role may CREATE in schema
+                                    public or the database, or a bus table has a
+                                    foreign owner
   1. archive tables (tools/migrate_archive.py)
   2. migrations/002_hardening.sql   claim tokens, one fact head per key,
                                     lifetime dedupe, tasks, wake deliveries,
@@ -54,6 +55,9 @@ def apply(conn, grants=None):
     try:
         # Fail fast instead of stalling every client behind a long transaction.
         cur.execute("SET LOCAL lock_timeout = '10s'")
+        # Unqualified CREATEs land in public; the preflight (first step) has already
+        # refused any bus role that could create objects there or in the database.
+        cur.execute("SET LOCAL search_path = public, pg_catalog, pg_temp")
         for _, sql in steps():
             cur.execute(sql)
         if grants is None:

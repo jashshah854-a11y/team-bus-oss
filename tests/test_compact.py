@@ -89,6 +89,13 @@ def setUpModule():
                    stop=[exe("pg_ctl"), "-D", data, "-m", "fast", "-w", "stop"], dir=d)
 
 
+def _drop_db(name):
+    conn = psycopg2.connect(_server["admin"])
+    conn.autocommit = True
+    conn.cursor().execute("DROP DATABASE IF EXISTS " + name + " WITH (FORCE)")
+    conn.close()
+
+
 def tearDownModule():
     if "stop" in _server:
         subprocess.run(_server["stop"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -115,6 +122,7 @@ class CompactTests(unittest.TestCase):
         self.admin = psycopg2.connect(_server["admin"])
         self.admin.autocommit = True
         self.admin.cursor().execute("CREATE DATABASE " + self.name)
+        self.addCleanup(_drop_db, self.name)   # also runs when setUp fails
         self.dsn = _with_db(_server["admin"], self.name)
         self.conn = psycopg2.connect(self.dsn)
         self.conn.autocommit = True
@@ -168,7 +176,7 @@ class CompactTests(unittest.TestCase):
 
     def tearDown(self):
         self.conn.close()
-        self.admin.cursor().execute("DROP DATABASE " + self.name + " WITH (FORCE)")
+        self.admin.cursor().execute("DROP DATABASE IF EXISTS " + self.name + " WITH (FORCE)")
         self.admin.close()
         shutil.rmtree(self.tmp, ignore_errors=True)
 

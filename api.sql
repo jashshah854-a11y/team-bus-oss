@@ -18,8 +18,8 @@
 -- of this, as they own the data anyway.
 
 -- preflight:begin
--- Refuse to install into a schema that other roles can write to. With CREATE on
--- public, any login could plant a table, trigger, function or operator that the
+-- Refuse to install while bus roles can create objects (CREATE on schema public
+-- or on the database). With that, a login could plant a table, trigger, function or operator that the
 -- owner's code then runs (privilege escalation), or an overload that makes every
 -- bus function ambiguous. The same block runs first in schema.sql, api.sql and
 -- tools/migrate.py, before any table is touched.
@@ -30,12 +30,32 @@ DECLARE
      WHERE c.oid = to_regclass('public.team_members')), current_user);
   t text;
   o name;
+  r text;
+  bus_roles text[] := ARRAY['public'];
 BEGIN
-  IF has_schema_privilege('public', 'public', 'CREATE') THEN
-    RAISE EXCEPTION 'teambus: every role may CREATE in schema public; run '
-      '"REVOKE CREATE ON SCHEMA public FROM PUBLIC" first (grant CREATE back to specific '
-      'roles that need it). Nothing was changed.';
+  -- Every role a member can act as: PUBLIC, the runtime group, and each mapped login.
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'teambus_agent') THEN
+    bus_roles := bus_roles || 'teambus_agent'::text;
   END IF;
+  IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public'
+             AND table_name = 'team_members' AND column_name = 'db_role') THEN
+    EXECUTE 'SELECT coalesce(array_agg(m.db_role), ARRAY[]::text[]) FROM public.team_members m '
+            'JOIN pg_catalog.pg_roles x ON x.rolname = m.db_role'
+      INTO t;
+    bus_roles := bus_roles || t::text[];
+  END IF;
+  FOREACH r IN ARRAY bus_roles LOOP
+    IF r <> ref_owner AND has_schema_privilege(r, 'public', 'CREATE') THEN
+      RAISE EXCEPTION 'teambus: role % may CREATE in schema public; run '
+        '"REVOKE CREATE ON SCHEMA public FROM %" first. Nothing was changed.',
+        r, CASE WHEN r = 'public' THEN 'PUBLIC' ELSE quote_ident(r) END;
+    END IF;
+    IF r <> ref_owner AND has_database_privilege(r, current_database(), 'CREATE') THEN
+      RAISE EXCEPTION 'teambus: role % may CREATE schemas in this database, which lets it shadow '
+        'other logins'' tables; run "REVOKE CREATE ON DATABASE % FROM %" first. Nothing was changed.',
+        r, quote_ident(current_database()), CASE WHEN r = 'public' THEN 'PUBLIC' ELSE quote_ident(r) END;
+    END IF;
+  END LOOP;
   FOREACH t IN ARRAY ARRAY['team_settings', 'team_members', 'team_messages', 'team_facts',
       'team_idempotency', 'team_tasks', 'team_wake_deliveries', 'team_messages_archive',
       'team_facts_archive']
